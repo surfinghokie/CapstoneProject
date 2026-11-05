@@ -6,75 +6,109 @@
 //
 
 import SwiftUI
-import SwiftData
 
+enum AppTab: Hashable {
+    case go
+    case explore
+    case activity
+    case account
+}
+
+/// Main app content view that provides the TabView navigation
 struct ContentView: View {
-    @Environment(\.modelContext) private var modelContext
-    @Query private var items: [Item]
+    @EnvironmentObject var authManager: AuthSessionManager
+    @StateObject private var viewModel = AppViewModel()
+    @StateObject private var rideTrackingManager = RideTrackingManager()
+    @AppStorage("appearanceMode") private var appearanceMode = 0
+    @AppStorage("hasCompletedProfileSetup") private var hasCompletedProfileSetup = false
+    @State private var selectedTab: AppTab = .go
+    @State private var showProfileSetup = false
 
     var body: some View {
-        NavigationViewWrapper {
-            List {
-                ForEach(items) { item in
-                    NavigationLink {
-                        Text("Item at \(item.timestamp, format: Date.FormatStyle(date: .numeric, time: .standard))")
-                    } label: {
-                        Text(item.timestamp, format: Date.FormatStyle(date: .numeric, time: .standard))
-                    }
-                }
-                .onDelete(perform: deleteItems)
+        TabView(selection: $selectedTab) {
+            NavigationStack {
+                GoView(selectedTab: $selectedTab)
             }
-#if os(macOS)
-            .navigationSplitViewColumnWidth(min: 180, ideal: 200)
-#endif
-            .toolbar {
-#if os(iOS)
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    EditButton()
-                }
-#endif
-                ToolbarItem {
-                    Button(action: addItem) {
-                        Label("Add Item", systemImage: "plus")
-                    }
-                }
+            .environmentObject(viewModel)
+            .environmentObject(rideTrackingManager)
+            .tag(AppTab.go)
+            .tabItem {
+                Label("Go", systemImage: "bicycle")
+            }
+
+            NavigationStack {
+                ExploreView()
+            }
+            .environmentObject(viewModel)
+            .environmentObject(rideTrackingManager)
+            .tag(AppTab.explore)
+            .tabItem {
+                Label("Explore", systemImage: "map")
+            }
+
+            NavigationStack {
+                ActivityView()
+            }
+            .environmentObject(viewModel)
+            .environmentObject(rideTrackingManager)
+            .tag(AppTab.activity)
+            .tabItem {
+                Label("Activity", systemImage: "person.3")
+            }
+
+            NavigationStack {
+                AccountView()
+            }
+            .environmentObject(viewModel)
+            .environmentObject(rideTrackingManager)
+            .tag(AppTab.account)
+            .tabItem {
+                Label("Account", systemImage: "person.crop.circle")
+            }
+        }
+        .tint(Color("VTMaroon"))
+        .preferredColorScheme(preferredColorScheme)
+        .onReceive(authManager.$state) { state in
+            switch state {
+            case .signedIn(let session):
+                viewModel.configureBackendSession(uid: session.uid, email: session.email)
+                showProfileSetup = false
+            default:
+                viewModel.clearBackendSession()
+                showProfileSetup = false
+            }
+        }
+        .onReceive(viewModel.$didFinishInitialProfileLoad) { didFinish in
+            guard didFinish else { return }
+            guard authManager.isAuthenticated else { return }
+
+            let name = viewModel.currentUser.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            showProfileSetup = !hasCompletedProfileSetup && name.isEmpty
+        }
+        .sheet(isPresented: $showProfileSetup) {
+            ProfileSetupView(
+                initialName: viewModel.currentUser.name,
+                initialIsVTStudent: viewModel.currentUser.isVTStudent
+            ) { name, isVTStudent, profileImageData in
+                viewModel.updateCurrentUserProfile(name: name, isVTStudent: isVTStudent, profileImageData: profileImageData)
+                hasCompletedProfileSetup = true
+                showProfileSetup = false
             }
         }
     }
 
-    private func addItem() {
-        withAnimation {
-            let newItem = Item(timestamp: Date())
-            modelContext.insert(newItem)
-        }
-    }
-
-    private func deleteItems(offsets: IndexSet) {
-        withAnimation {
-            for index in offsets {
-                modelContext.delete(items[index])
-            }
+    private var preferredColorScheme: ColorScheme? {
+        switch appearanceMode {
+        case 1: return .light
+        case 2: return .dark
+        default: return nil
         }
     }
 }
 
-fileprivate struct NavigationViewWrapper<Content: View>: View {
-    let content: () -> Content
-
-    var body: some View {
-#if os(macOS)
-        NavigationSplitView {
-            content()
-        } detail: {
-            Text("Select an item")
-        }
-#else
-        content()
-#endif
+struct ContentView_Previews: PreviewProvider {
+    static var previews: some View {
+        ContentView()
+            .environmentObject(AuthSessionManager())
     }
-}
-
-#Preview {
-    ContentView()
-        .modelContainer(for: Item.self, inMemory: true)
 }
