@@ -221,8 +221,14 @@ final class AuthSessionManager: ObservableObject {
         return "Sign-in failed (\(error.domain):\(error.code)): \(error.localizedDescription)"
     }
 
+    // TEMP: non-VT testers whose VT mail filters drop the Firebase sign-in email.
+    // Remove before release.
+    private let allowedTesterEmails: Set<String> = [
+        "ethan.luchsrivera@gmail.com",
+    ]
+
     private func isVTEmail(_ email: String) -> Bool {
-        email.hasSuffix("@vt.edu") || email.hasSuffix("@g.vt.edu")
+        email.hasSuffix("@vt.edu") || email.hasSuffix("@g.vt.edu") || allowedTesterEmails.contains(email)
     }
 
     private func signInLocally(with email: String) {
