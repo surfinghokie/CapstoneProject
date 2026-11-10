@@ -17,12 +17,14 @@ struct PostComment: Identifiable, Equatable {
 struct CommunityPost: Identifiable, Equatable {
     let id: UUID
     let authorName: String
+    let authorID: String?
     let journeyTitle: String
     let bodyText: String
     let createdAt: Date
     let attachedRentalID: UUID?
     var likes: Int
     var isLikedByCurrentUser: Bool
+    var likedUserIDs: Set<String>
     var comments: [PostComment]
     var imageData: Data?
     var photoURL: String?
@@ -30,24 +32,28 @@ struct CommunityPost: Identifiable, Equatable {
     init(
         id: UUID = UUID(),
         authorName: String,
+        authorID: String? = nil,
         journeyTitle: String,
         bodyText: String,
         createdAt: Date = Date(),
         attachedRentalID: UUID? = nil,
         likes: Int = 0,
         isLikedByCurrentUser: Bool = false,
+        likedUserIDs: Set<String> = [],
         comments: [PostComment] = [],
         imageData: Data? = nil,
         photoURL: String? = nil
     ) {
         self.id = id
         self.authorName = authorName
+        self.authorID = authorID
         self.journeyTitle = journeyTitle
         self.bodyText = bodyText
         self.createdAt = createdAt
         self.attachedRentalID = attachedRentalID
         self.likes = likes
         self.isLikedByCurrentUser = isLikedByCurrentUser
+        self.likedUserIDs = likedUserIDs
         self.comments = comments
         self.imageData = imageData
         self.photoURL = photoURL

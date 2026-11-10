@@ -63,6 +63,58 @@ struct BikeDetailView: View {
                         .foregroundColor(.secondary)
                 }
 
+                if bluetoothLockManager.isBusy || !bluetoothLockManager.discoveredDevices.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("Nearby Bluetooth Devices")
+                                .font(.subheadline.weight(.semibold))
+                            Spacer()
+                            if bluetoothLockManager.isScanning {
+                                ProgressView()
+                                    .controlSize(.small)
+                            }
+                        }
+
+                        if bluetoothLockManager.discoveredDevices.isEmpty {
+                            Text("Scanning for nearby devices...")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        } else {
+                            ForEach(bluetoothLockManager.discoveredDevices) { device in
+                                HStack(spacing: 8) {
+                                    Image(systemName: device.isCandidate ? "dot.radiowaves.left.and.right" : "dot.radiowaves.up.forward")
+                                        .foregroundColor(device.isCandidate ? Color("VTOrange") : .secondary)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(device.name)
+                                            .font(.caption)
+                                        Text("RSSI \(device.rssi) dBm")
+                                            .font(.caption2)
+                                            .foregroundColor(.secondary)
+                                        if !device.advertisedUUIDs.isEmpty {
+                                            Text("UUIDs: \(device.advertisedUUIDs.joined(separator: ", "))")
+                                                .font(.caption2)
+                                                .foregroundColor(.secondary)
+                                                .lineLimit(2)
+                                        }
+                                    }
+                                    Spacer()
+                                    if device.isCandidate {
+                                        Text("Possible lock")
+                                            .font(.caption2)
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 3)
+                                            .background(Color("VTOrange").opacity(0.15))
+                                            .clipShape(Capsule())
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    .padding(10)
+                    .background(Color(.secondarySystemBackground))
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                }
+
                 Button(action: {
                     Task {
                         await unlockAndStartRide()

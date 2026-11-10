@@ -2,6 +2,11 @@ import Foundation
 import SwiftUI
 import Combine
 import CoreLocation
+#if canImport(UIKit)
+import UIKit
+#elseif canImport(AppKit)
+import AppKit
+#endif
 
 #if canImport(FirebaseFirestore)
 import FirebaseFirestore
@@ -34,6 +39,7 @@ final class AppViewModel: ObservableObject {
     @Published var lastSyncAt: Date?
     @Published var lastSyncError: String?
     @Published var latestRideSnapshotID: String?
+    @Published var routePathByRentalID: [UUID: [CLLocationCoordinate2D]] = [:]
 
     private var backendUID: String?
     private var backendEmail: String?
@@ -204,11 +210,13 @@ final class AppViewModel: ObservableObject {
     func createPost(journeyTitle: String, bodyText: String, imageData: Data?) {
         let post = CommunityPost(
             authorName: currentUser.name,
+            authorID: backendUID,
             journeyTitle: journeyTitle,
             bodyText: bodyText,
             attachedRentalID: mostRecentCompletedRental?.id,
             likes: 0,
             isLikedByCurrentUser: false,
+            likedUserIDs: [],
             comments: [],
             imageData: imageData,
             photoURL: nil
@@ -254,13 +262,39 @@ final class AppViewModel: ObservableObject {
 
     func toggleLike(postID: UUID) {
         guard let idx = communityPosts.firstIndex(where: { $0.id == postID }) else { return }
-        communityPosts[idx].isLikedByCurrentUser.toggle()
-        communityPosts[idx].likes += communityPosts[idx].isLikedByCurrentUser ? 1 : -1
-        communityPosts[idx].likes = max(0, communityPosts[idx].likes)
+
+        guard let uid = backendUID else {
+            // Local fallback for unauthenticated sessions.
+            communityPosts[idx].isLikedByCurrentUser.toggle()
+            communityPosts[idx].likes += communityPosts[idx].isLikedByCurrentUser ? 1 : -1
+            communityPosts[idx].likes = max(0, communityPosts[idx].likes)
+            return
+        }
+
+        if communityPosts[idx].likedUserIDs.isEmpty {
+            // Legacy docs without per-user like sets.
+            communityPosts[idx].isLikedByCurrentUser.toggle()
+            communityPosts[idx].likes += communityPosts[idx].isLikedByCurrentUser ? 1 : -1
+            communityPosts[idx].likes = max(0, communityPosts[idx].likes)
+        } else {
+            if communityPosts[idx].likedUserIDs.contains(uid) {
+                communityPosts[idx].likedUserIDs.remove(uid)
+            } else {
+                communityPosts[idx].likedUserIDs.insert(uid)
+            }
+
+            communityPosts[idx].isLikedByCurrentUser = communityPosts[idx].likedUserIDs.contains(uid)
+            communityPosts[idx].likes = communityPosts[idx].likedUserIDs.count
+        }
 
         Task {
-            await persistCommunityPost(communityPosts[idx])
+            await persistPostEngagement(communityPosts[idx])
         }
+    }
+
+    func routePath(for rentalID: UUID?) -> [CLLocationCoordinate2D]? {
+        guard let rentalID else { return nil }
+        return routePathByRentalID[rentalID]
     }
 
     func addComment(postID: UUID, text: String) {
@@ -270,7 +304,7 @@ final class AppViewModel: ObservableObject {
         communityPosts[idx].comments.append(PostComment(authorName: currentUser.name, text: trimmed))
 
         Task {
-            await persistCommunityPost(communityPosts[idx])
+            await persistPostEngagement(communityPosts[idx])
         }
     }
 
@@ -767,21 +801,30 @@ final class AppViewModel: ObservableObject {
         let ref = db.collection("posts").document(post.id.uuidString)
 
         var imageURLString = post.photoURL ?? ""
+        var imageBase64String = ""
 #if canImport(FirebaseStorage)
         if let imageData = post.imageData {
             imageURLString = await uploadPostImageData(imageData, postID: post.id) ?? ""
+            if imageURLString.isEmpty, let compressed = compressedJPEGData(from: imageData) {
+                imageBase64String = compressed.base64EncodedString()
+            }
+        }
+#else
+        if let imageData = post.imageData, let compressed = compressedJPEGData(from: imageData) {
+            imageBase64String = compressed.base64EncodedString()
         }
 #endif
 
         let payload: [String: Any] = [
             "postId": post.id.uuidString,
-            "authorId": uid,
+            "authorId": post.authorID ?? uid,
             "pilotID": currentUser.pilotID ?? "",
             "authorName": post.authorName,
             "journeyTitle": post.journeyTitle,
             "bodyText": post.bodyText,
             "attachedRentalId": post.attachedRentalID?.uuidString ?? "",
             "likes": post.likes,
+            "likedUserIDs": Array(post.likedUserIDs),
             "isLikedByCurrentUser": post.isLikedByCurrentUser,
             "comments": post.comments.map {
                 [
@@ -792,6 +835,7 @@ final class AppViewModel: ObservableObject {
                 ]
             },
             "photoURL": imageURLString,
+            "imageBase64": imageBase64String,
             "createdAt": Timestamp(date: post.createdAt),
             "updatedAt": Timestamp(date: Date())
         ]
@@ -813,6 +857,36 @@ final class AppViewModel: ObservableObject {
 #endif
     }
 
+
+
+    private func persistPostEngagement(_ post: CommunityPost) async {
+#if canImport(FirebaseFirestore)
+        guard backendUID != nil else { return }
+        let db = Firestore.firestore()
+        let ref = db.collection("posts").document(post.id.uuidString)
+
+        let payload: [String: Any] = [
+            "likes": post.likes,
+            "isLikedByCurrentUser": post.isLikedByCurrentUser,
+            "comments": post.comments.map {
+                [
+                    "id": $0.id.uuidString,
+                    "authorName": $0.authorName,
+                    "text": $0.text,
+                    "createdAt": Timestamp(date: $0.createdAt)
+                ]
+            },
+            "updatedAt": Timestamp(date: Date())
+        ]
+
+        do {
+            try await ref.setData(payload, merge: true)
+            markSyncSuccess("Post engagement synced")
+        } catch {
+            markSyncFailure("Post engagement sync failed", error: error)
+        }
+#endif
+    }
     private func deleteCommunityPostFromBackend(postID: UUID) async {
 #if canImport(FirebaseFirestore)
         guard backendUID != nil else { return }
@@ -992,6 +1066,7 @@ final class AppViewModel: ObservableObject {
             if !loaded.isEmpty {
                 communityPosts = loaded
             }
+            await hydrateRoutePathsForCommunityPosts(posts: loaded)
             markSyncSuccess("Posts loaded")
         } catch {
             markSyncFailure("Post load failed", error: error)
@@ -1025,6 +1100,8 @@ final class AppViewModel: ObservableObject {
                         self.communityPosts = loaded
                     }
 
+                    await self.hydrateRoutePathsForCommunityPosts(posts: loaded)
+
                     self.markSyncSuccess("Community feed live")
                 }
             }
@@ -1047,11 +1124,22 @@ final class AppViewModel: ObservableObject {
             return nil
         }
 
+        let authorID = data["authorId"] as? String
         let createdAt = (data["createdAt"] as? Timestamp)?.dateValue() ?? Date.distantPast
-        let likes = data["likes"] as? Int ?? 0
-        let isLikedByCurrentUser = data["isLikedByCurrentUser"] as? Bool ?? false
+        let legacyLikes = data["likes"] as? Int ?? 0
+        let likedUserIDsArray = data["likedUserIDs"] as? [String] ?? []
+        let likedUserIDs = Set(likedUserIDsArray)
+        let likes = likedUserIDs.isEmpty ? legacyLikes : likedUserIDs.count
+        let isLikedByCurrentUser = {
+            let legacyUserLike = data["isLikedByCurrentUser"] as? Bool ?? false
+            guard let uid = backendUID else { return legacyUserLike }
+            if likedUserIDs.isEmpty { return legacyUserLike }
+            return likedUserIDs.contains(uid)
+        }()
         let attachedRentalID = UUID(uuidString: data["attachedRentalId"] as? String ?? "")
         let photoURL = data["photoURL"] as? String
+        let imageBase64 = data["imageBase64"] as? String
+        let decodedImageData = imageBase64.flatMap { Data(base64Encoded: $0) }
 
         let rawComments = data["comments"] as? [[String: Any]] ?? []
         let comments: [PostComment] = rawComments.compactMap { entry in
@@ -1070,17 +1158,89 @@ final class AppViewModel: ObservableObject {
         return CommunityPost(
             id: postID,
             authorName: authorName,
+            authorID: authorID,
             journeyTitle: journeyTitle,
             bodyText: bodyText,
             createdAt: createdAt,
             attachedRentalID: attachedRentalID,
             likes: likes,
             isLikedByCurrentUser: isLikedByCurrentUser,
+            likedUserIDs: likedUserIDs,
             comments: comments,
-            imageData: nil,
+            imageData: decodedImageData,
             photoURL: photoURL
         )
     }
+
+
+    private func decodeCoordinatePath(from raw: Any?) -> [CLLocationCoordinate2D] {
+        guard let entries = raw as? [[String: Any]] else { return [] }
+        return entries.compactMap { item in
+            guard let lat = item["lat"] as? Double, let lng = item["lng"] as? Double else { return nil }
+            return CLLocationCoordinate2D(latitude: lat, longitude: lng)
+        }
+    }
+
+    private func decodeCoordinatePath(fromDoubleDict raw: Any?) -> [CLLocationCoordinate2D] {
+        guard let entries = raw as? [[String: Double]] else { return [] }
+        return entries.compactMap { item in
+            guard let lat = item["lat"], let lng = item["lng"] else { return nil }
+            return CLLocationCoordinate2D(latitude: lat, longitude: lng)
+        }
+    }
+
+    private func mergeDecodedPath(_ data: [String: Any]) -> [CLLocationCoordinate2D] {
+        let primary = decodeCoordinatePath(from: data["trackedPath"])
+        if !primary.isEmpty { return primary }
+        let fallbackA = decodeCoordinatePath(from: data["trackedPathSample"])
+        if !fallbackA.isEmpty { return fallbackA }
+        let fallbackB = decodeCoordinatePath(fromDoubleDict: data["trackedPath"])
+        if !fallbackB.isEmpty { return fallbackB }
+        return decodeCoordinatePath(fromDoubleDict: data["trackedPathSample"])
+    }
+
+    private func chunked<T>(_ array: [T], size: Int) -> [[T]] {
+        guard size > 0 else { return [array] }
+        var result: [[T]] = []
+        var index = 0
+        while index < array.count {
+            let end = min(index + size, array.count)
+            result.append(Array(array[index..<end]))
+            index = end
+        }
+        return result
+    }
+
+    private func hydrateRoutePathsForCommunityPosts(posts: [CommunityPost]) async {
+#if canImport(FirebaseFirestore)
+        let rentalIDs = Array(Set(posts.compactMap(\.attachedRentalID)))
+        guard !rentalIDs.isEmpty else { return }
+
+        let uncached = rentalIDs.filter { routePathByRentalID[$0] == nil }
+        guard !uncached.isEmpty else { return }
+
+        let db = Firestore.firestore()
+        for group in chunked(uncached, size: 10) {
+            let documentIDs = group.map(\.uuidString)
+            do {
+                let snapshot = try await db.collection("ride_snapshots")
+                    .whereField(FieldPath.documentID(), in: documentIDs)
+                    .getDocuments()
+
+                for doc in snapshot.documents {
+                    guard let rentalID = UUID(uuidString: doc.documentID) else { continue }
+                    let path = mergeDecodedPath(doc.data())
+                    if !path.isEmpty {
+                        routePathByRentalID[rentalID] = path
+                    }
+                }
+            } catch {
+                markSyncFailure("Route hydration failed", error: error)
+            }
+        }
+#endif
+    }
+
 #endif
 
     private func samplePath(_ trackedPath: [CLLocationCoordinate2D], maxPoints: Int) -> [[String: Double]] {
@@ -1128,6 +1288,20 @@ final class AppViewModel: ObservableObject {
         }
 
         return (minLat, maxLat, minLng, maxLng)
+    }
+
+    private func compressedJPEGData(from input: Data) -> Data? {
+#if canImport(UIKit)
+        guard let image = UIImage(data: input) else { return nil }
+        return image.jpegData(compressionQuality: 0.35)
+#elseif canImport(AppKit)
+        guard let image = NSImage(data: input),
+              let tiffData = image.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiffData) else { return nil }
+        return rep.representation(using: .jpeg, properties: [.compressionFactor: 0.35])
+#else
+        return nil
+#endif
     }
 
     private func markSyncSuccess(_ status: String) {

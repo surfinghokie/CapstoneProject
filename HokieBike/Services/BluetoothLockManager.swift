@@ -6,6 +6,19 @@ import Combine
 final class BluetoothLockManager: NSObject, ObservableObject {
     @Published var statusMessage: String = ""
     @Published var isBusy = false
+    @Published var isScanning = false
+    @Published var discoveredDevices: [DiscoveredDevice] = []
+
+    struct DiscoveredDevice: Identifiable {
+        let id: UUID
+        let name: String
+        let rssi: Int
+        let isCandidate: Bool
+        let advertisedUUIDs: [String]
+    }
+
+    // Firmware docs mention all dev boards can share name, so this is only a fallback hint.
+    private let expectedNamePrefix = "VT-LOCK"
 
     private enum LockUUID {
         static let service = CBUUID(string: "8F2A1C00-5B7E-4D19-9A3F-6C2E81D4B70A")
@@ -75,10 +88,24 @@ final class BluetoothLockManager: NSObject, ObservableObject {
     private var expectedResultSeq: UInt8?
     private var waitingForSettle = false
     private var sawInitialStatus = false
+    private var hasConnectedPeripheral = false
+    private var attemptedBroadScan = false
+    private var isBroadScanMode = false
+    private var shouldResumeBroadScanAfterDisconnect = false
+    private var attemptedPeripheralIDs: Set<UUID> = []
+
+    private func resetDiscoveryUI() {
+        discoveredDevices = []
+        isScanning = false
+    }
 
     override init() {
         super.init()
-        central = CBCentralManager(delegate: self, queue: nil)
+        central = CBCentralManager(
+            delegate: self,
+            queue: nil,
+            options: [CBCentralManagerOptionShowPowerAlertKey: true]
+        )
     }
 
     func unlockDemoBike() async -> Bool {
@@ -91,8 +118,17 @@ final class BluetoothLockManager: NSObject, ObservableObject {
         statusMessage = "Simulator mode: unlock simulated as success."
         return true
         #else
+        if #available(iOS 13.0, *) {
+            let auth = CBManager.authorization
+            if auth == .denied || auth == .restricted {
+                statusMessage = "Bluetooth permission denied. Enable HokieBike in Settings > Privacy & Security > Bluetooth."
+                return false
+            }
+        }
+
         isBusy = true
         statusMessage = "Scanning for lock..."
+        resetDiscoveryUI()
 
         return await withCheckedContinuation { continuation in
             self.continuation = continuation
@@ -100,6 +136,11 @@ final class BluetoothLockManager: NSObject, ObservableObject {
             self.waitingForSettle = false
             self.expectedResultSeq = nil
             self.characteristics = [:]
+            self.hasConnectedPeripheral = false
+            self.attemptedBroadScan = false
+            self.isBroadScanMode = false
+            self.shouldResumeBroadScanAfterDisconnect = false
+            self.attemptedPeripheralIDs = []
 
             guard let central else {
                 finish(success: false, message: "Bluetooth unavailable on this device.")
@@ -107,13 +148,75 @@ final class BluetoothLockManager: NSObject, ObservableObject {
             }
 
             if central.state == .poweredOn {
-                central.scanForPeripherals(withServices: [LockUUID.service])
-                scheduleTimeout(seconds: 10, message: "Lock not found. It may be in use by another phone.")
+                startScan(filtered: true)
             } else {
-                scheduleTimeout(seconds: 5, message: "Bluetooth is off. Turn it on and try again.")
+                scheduleTimeout(seconds: 5, message: "Waiting for Bluetooth to become ready...")
             }
         }
         #endif
+    }
+
+    private func startScan(filtered: Bool) {
+        guard let central else { return }
+        isBroadScanMode = !filtered
+        isScanning = true
+        statusMessage = filtered ? "Scanning for lock..." : "Expanded scan running..."
+        central.stopScan()
+        central.scanForPeripherals(withServices: filtered ? [LockUUID.service] : nil)
+
+        if filtered {
+            scheduleBroadScanFallback()
+        }
+        scheduleTimeout(seconds: 12, message: "Lock not found. Ensure lock is powered on and not connected to another phone.")
+    }
+
+    private func scheduleBroadScanFallback() {
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            guard let self, self.continuation != nil, !self.hasConnectedPeripheral, !self.attemptedBroadScan else { return }
+            self.attemptedBroadScan = true
+            self.startScan(filtered: false)
+        }
+    }
+
+    private func isCandidateLock(_ peripheral: CBPeripheral, advertisementData: [String: Any]) -> Bool {
+        if let serviceUUIDs = advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID],
+           serviceUUIDs.contains(LockUUID.service) {
+            return true
+        }
+
+        if let overflowUUIDs = advertisementData[CBAdvertisementDataOverflowServiceUUIDsKey] as? [CBUUID],
+           overflowUUIDs.contains(LockUUID.service) {
+            return true
+        }
+
+        if let localName = (advertisementData[CBAdvertisementDataLocalNameKey] as? String)?.uppercased(),
+           localName.contains(expectedNamePrefix) {
+            return true
+        }
+
+        if let name = peripheral.name?.uppercased(), name.contains(expectedNamePrefix) {
+            return true
+        }
+
+        return false
+    }
+
+    private func advertisedUUIDList(from advertisementData: [String: Any]) -> [String] {
+        let serviceUUIDs = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID]) ?? []
+        let overflowUUIDs = (advertisementData[CBAdvertisementDataOverflowServiceUUIDsKey] as? [CBUUID]) ?? []
+        let all = serviceUUIDs + overflowUUIDs
+        return Array(Set(all.map(\.uuidString))).sorted()
+    }
+
+    private func resumeBroadScanAfterReject(_ message: String) {
+        statusMessage = message
+        shouldResumeBroadScanAfterDisconnect = true
+        if let peripheral, let central {
+            central.cancelPeripheralConnection(peripheral)
+        } else {
+            startScan(filtered: false)
+        }
     }
 
     private func scheduleTimeout(seconds: Double, message: String) {
@@ -129,6 +232,10 @@ final class BluetoothLockManager: NSObject, ObservableObject {
         statusMessage = message
         timeoutTask?.cancel()
         timeoutTask = nil
+        shouldResumeBroadScanAfterDisconnect = false
+        isScanning = false
+
+        central?.stopScan()
 
         if let peripheral, let central {
             central.cancelPeripheralConnection(peripheral)
@@ -148,18 +255,67 @@ extension BluetoothLockManager: CBCentralManagerDelegate {
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         guard continuation != nil else { return }
 
-        if central.state == .poweredOn {
-            statusMessage = "Scanning for lock..."
-            central.scanForPeripherals(withServices: [LockUUID.service])
-            scheduleTimeout(seconds: 10, message: "Lock not found. It may be connected to another phone.")
+        switch central.state {
+        case .poweredOn:
+            startScan(filtered: true)
+        case .poweredOff:
+            finish(success: false, message: "Bluetooth is off. Turn it on and try again.")
+        case .unauthorized:
+            finish(success: false, message: "Bluetooth permission denied. Enable it in Settings > Privacy & Security > Bluetooth.")
+        case .unsupported:
+            finish(success: false, message: "Bluetooth is unsupported on this device.")
+        case .resetting:
+            scheduleTimeout(seconds: 5, message: "Bluetooth is resetting. Try again in a moment.")
+        case .unknown:
+            scheduleTimeout(seconds: 5, message: "Bluetooth state unknown. Waiting...")
+        @unknown default:
+            finish(success: false, message: "Unknown Bluetooth state.")
         }
     }
 
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String : Any], rssi RSSI: NSNumber) {
+        let discoveredAsCandidate = isCandidateLock(peripheral, advertisementData: advertisementData)
+        let displayName = peripheral.name ?? (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? "Unknown"
+        let advertisedUUIDs = advertisedUUIDList(from: advertisementData)
+
+        if let idx = discoveredDevices.firstIndex(where: { $0.id == peripheral.identifier }) {
+            discoveredDevices[idx] = DiscoveredDevice(
+                id: peripheral.identifier,
+                name: displayName,
+                rssi: RSSI.intValue,
+                isCandidate: discoveredAsCandidate,
+                advertisedUUIDs: advertisedUUIDs
+            )
+        } else {
+            discoveredDevices.append(
+                DiscoveredDevice(
+                    id: peripheral.identifier,
+                    name: displayName,
+                    rssi: RSSI.intValue,
+                    isCandidate: discoveredAsCandidate,
+                    advertisedUUIDs: advertisedUUIDs
+                )
+            )
+        }
+
+        discoveredDevices.sort { $0.rssi > $1.rssi }
+        if discoveredDevices.count > 10 {
+            discoveredDevices = Array(discoveredDevices.prefix(10))
+        }
+
+        guard !attemptedPeripheralIDs.contains(peripheral.identifier) else { return }
+        if !discoveredAsCandidate {
+            // In broad scan fallback, probe plausible nearby peripherals even if names are unexpected.
+            guard isBroadScanMode, RSSI.intValue > -90 else { return }
+        }
+
         central.stopScan()
+        isScanning = false
+        attemptedPeripheralIDs.insert(peripheral.identifier)
+        hasConnectedPeripheral = true
         self.peripheral = peripheral
         peripheral.delegate = self
-        statusMessage = "Connecting to lock..."
+        statusMessage = "Connecting to \(displayName)..."
         central.connect(peripheral)
         scheduleTimeout(seconds: 10, message: "Could not connect to lock.")
     }
@@ -179,6 +335,11 @@ extension BluetoothLockManager: CBCentralManagerDelegate {
         self.characteristics = [:]
 
         guard continuation != nil else { return }
+        if shouldResumeBroadScanAfterDisconnect {
+            shouldResumeBroadScanAfterDisconnect = false
+            startScan(filtered: false)
+            return
+        }
         if isBusy {
             finish(success: false, message: "Disconnected before unlock completed.")
         }
@@ -189,7 +350,11 @@ extension BluetoothLockManager: CBPeripheralDelegate {
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         guard error == nil,
               let service = peripheral.services?.first(where: { $0.uuid == LockUUID.service }) else {
-            finish(success: false, message: "Lock service unavailable.")
+            if isBroadScanMode {
+                resumeBroadScanAfterReject("Found non-lock BLE device. Continuing scan...")
+            } else {
+                finish(success: false, message: "Lock service unavailable.")
+            }
             return
         }
 
@@ -199,7 +364,11 @@ extension BluetoothLockManager: CBPeripheralDelegate {
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
         guard error == nil else {
-            finish(success: false, message: "Could not read lock characteristics.")
+            if isBroadScanMode {
+                resumeBroadScanAfterReject("Non-lock characteristics detected. Continuing scan...")
+            } else {
+                finish(success: false, message: "Could not read lock characteristics.")
+            }
             return
         }
 
@@ -208,7 +377,11 @@ extension BluetoothLockManager: CBPeripheralDelegate {
         }
 
         guard let info = characteristics[LockUUID.info], characteristics[LockUUID.command] != nil, characteristics[LockUUID.status] != nil else {
-            finish(success: false, message: "Lock firmware is missing required characteristics.")
+            if isBroadScanMode {
+                resumeBroadScanAfterReject("Incomplete lock profile. Continuing scan...")
+            } else {
+                finish(success: false, message: "Lock firmware is missing required characteristics.")
+            }
             return
         }
 

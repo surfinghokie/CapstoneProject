@@ -31,7 +31,7 @@ struct RideSummarySheetView: View {
                         onShareToCommunity()
                         didShareToCommunity = true
                     } label: {
-                        Label(didShareToCommunity ? "Shared to Community" : "Share to Community", systemImage: didShareToCommunity ? "checkmark.circle.fill" : "square.and.arrow.up")
+                        Label(didShareToCommunity ? "Posted" : "Post", systemImage: didShareToCommunity ? "checkmark.circle.fill" : "square.and.arrow.up")
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)

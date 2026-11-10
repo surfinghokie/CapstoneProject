@@ -1,4 +1,5 @@
 import SwiftUI
+import MapKit
 #if canImport(PhotosUI)
 import PhotosUI
 #endif
@@ -97,6 +98,18 @@ struct ActivityView: View {
                     Text(post.bodyText)
                         .font(.subheadline)
 
+                    if let path = viewModel.routePath(for: post.attachedRentalID), !path.isEmpty {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Route Window")
+                                .font(.caption.weight(.semibold))
+                                .foregroundColor(.secondary)
+                            PostRoutePreview(path: path)
+                        }
+                        .padding(10)
+                        .background(Color(.secondarySystemBackground))
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                    }
+
                     if let imageData = post.imageData {
                         CommunityPostImage(data: imageData)
                     } else if let photoURL = post.photoURL,
@@ -128,6 +141,7 @@ struct ActivityView: View {
                             Label("\(post.likes)", systemImage: post.isLikedByCurrentUser ? "heart.fill" : "heart")
                                 .foregroundColor(post.isLikedByCurrentUser ? .red : .primary)
                         }
+                        .buttonStyle(.borderless)
 
                         Text("\(post.comments.count) comments")
                             .font(.caption)
@@ -205,6 +219,57 @@ private struct CommunityPostImage: View {
     }
 }
 
+private struct PostRoutePreview: View {
+    let path: [CLLocationCoordinate2D]
+
+    private var region: MKCoordinateRegion {
+        guard let first = path.first else {
+            return MKCoordinateRegion(
+                center: CLLocationCoordinate2D(latitude: 37.2296, longitude: -80.4244),
+                span: MKCoordinateSpan(latitudeDelta: 0.02, longitudeDelta: 0.02)
+            )
+        }
+
+        var minLat = first.latitude
+        var maxLat = first.latitude
+        var minLng = first.longitude
+        var maxLng = first.longitude
+
+        for point in path.dropFirst() {
+            minLat = min(minLat, point.latitude)
+            maxLat = max(maxLat, point.latitude)
+            minLng = min(minLng, point.longitude)
+            maxLng = max(maxLng, point.longitude)
+        }
+
+        let center = CLLocationCoordinate2D(latitude: (minLat + maxLat) / 2.0, longitude: (minLng + maxLng) / 2.0)
+        let span = MKCoordinateSpan(
+            latitudeDelta: max(0.005, (maxLat - minLat) * 1.6),
+            longitudeDelta: max(0.005, (maxLng - minLng) * 1.6)
+        )
+        return MKCoordinateRegion(center: center, span: span)
+    }
+
+    var body: some View {
+        Map(initialPosition: .region(region)) {
+            if path.count > 1 {
+                MapPolyline(MKPolyline(coordinates: path, count: path.count))
+                    .stroke(Color("VTMaroon"), lineWidth: 4)
+            }
+            if let start = path.first {
+                Marker("Start", coordinate: start)
+                    .tint(.green)
+            }
+            if let end = path.last {
+                Marker("End", coordinate: end)
+                    .tint(.red)
+            }
+        }
+        .frame(height: 160)
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+}
+
 private struct PostComposerView: View {
     @Environment(\.dismiss) private var dismiss
 
@@ -252,7 +317,7 @@ private struct PostComposerView: View {
                 Button("Cancel") { dismiss() }
             }
             ToolbarItem(placement: .confirmationAction) {
-                Button("Share") {
+                Button("Post") {
                     onShare(journeyTitle.isEmpty ? "Recent Ride" : journeyTitle, bodyText, selectedImageData)
                     dismiss()
                 }
