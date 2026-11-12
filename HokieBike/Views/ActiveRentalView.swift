@@ -2,20 +2,16 @@ import SwiftUI
 import CoreLocation
 import MapKit
 
-extension CLLocationCoordinate2D: Equatable {
-    public static func == (lhs: CLLocationCoordinate2D, rhs: CLLocationCoordinate2D) -> Bool {
-        lhs.latitude == rhs.latitude && lhs.longitude == rhs.longitude
-    }
-}
-
 struct ActiveRentalView: View {
     let rental: Rental
     @EnvironmentObject var viewModel: AppViewModel
     @EnvironmentObject var rideTrackingManager: RideTrackingManager
     @StateObject private var locationManager = LocationPermissionManager()
+    @StateObject private var bluetoothLockManager = BluetoothLockManager()
     @State private var elapsedSeconds: TimeInterval = 0
     @State private var timerActive = true
     @State private var cameraPosition: MapCameraPosition = .automatic
+    @State private var isEndingRide = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -55,6 +51,12 @@ struct ActiveRentalView: View {
                     .foregroundColor(.secondary)
             }
 
+            if !bluetoothLockManager.statusMessage.isEmpty {
+                Text("Lock: \(bluetoothLockManager.statusMessage)")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+
             rideMap
 
             HStack(spacing: 10) {
@@ -80,31 +82,17 @@ struct ActiveRentalView: View {
 
             Button(action: {
                 Task {
-                    let coordinate: CLLocationCoordinate2D?
-                    if let current = rideTrackingManager.currentCoordinate {
-                        coordinate = current
-                    } else {
-                        coordinate = await locationManager.requestSingleLocation()
-                    }
-                    let endLocation = coordinate.map { point in
-                        String(format: "%.5f, %.5f", point.latitude, point.longitude)
-                    }
-                    rideTrackingManager.stopTracking()
-                    viewModel.endRental(
-                        endLocation: endLocation,
-                        endCoordinate: coordinate,
-                        destinationName: rideTrackingManager.destinationName,
-                        trackedPath: rideTrackingManager.trackedPath
-                    )
+                    await endRideAndSendLock()
                 }
             }) {
-                Text("End Ride")
+                Text(isEndingRide ? "Ending Ride..." : "Lock & End Ride")
                     .frame(maxWidth: .infinity)
                     .padding()
                     .background(Color.red)
                     .foregroundColor(.white)
                     .cornerRadius(10)
             }
+            .disabled(isEndingRide)
         }
         .onAppear {
             updateElapsed()
@@ -139,6 +127,37 @@ struct ActiveRentalView: View {
         }
     }
 
+    private func endRideAndSendLock() async {
+        guard !isEndingRide else { return }
+        isEndingRide = true
+        defer { isEndingRide = false }
+
+        let lockSucceeded = await bluetoothLockManager.lockDemoBike()
+        if !lockSucceeded {
+            // Keep UX moving for demos/pilots while still surfacing lock failure state.
+            bluetoothLockManager.statusMessage = "Lock command failed. Ending ride anyway."
+        }
+
+        let coordinate: CLLocationCoordinate2D?
+        if let current = rideTrackingManager.currentCoordinate {
+            coordinate = current
+        } else {
+            coordinate = await locationManager.requestSingleLocation()
+        }
+
+        let endLocation = coordinate.map { point in
+            String(format: "%.5f, %.5f", point.latitude, point.longitude)
+        }
+
+        rideTrackingManager.stopTracking()
+        viewModel.endRental(
+            endLocation: endLocation,
+            endCoordinate: coordinate,
+            destinationName: rideTrackingManager.destinationName,
+            trackedPath: rideTrackingManager.trackedPath
+        )
+    }
+
     private var rideMap: some View {
         Map(position: $cameraPosition) {
             if let route = rideTrackingManager.plannedRoute {
@@ -160,7 +179,7 @@ struct ActiveRentalView: View {
         }
         .frame(height: 220)
         .clipShape(RoundedRectangle(cornerRadius: 12))
-        .onChange(of: rideTrackingManager.currentCoordinate) { coordinate in
+        .onReceive(rideTrackingManager.$currentCoordinate) { coordinate in
             guard let coordinate else { return }
             withAnimation {
                 cameraPosition = .region(

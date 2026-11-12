@@ -63,6 +63,18 @@ struct BikeDetailView: View {
                         .foregroundColor(.secondary)
                 }
 
+                if bluetoothLockManager.lastCheckedAt != nil {
+                    Text("Lock state: \(bluetoothLockManager.lastKnownStateText) · checked \(bluetoothLockManager.lastCheckedAt!, style: .relative)")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+
+                if bluetoothLockManager.isBusy {
+                    Text("Session Step: \(bluetoothLockManager.sessionStep)")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+
                 if bluetoothLockManager.isBusy || !bluetoothLockManager.discoveredDevices.isEmpty {
                     VStack(alignment: .leading, spacing: 8) {
                         HStack {
@@ -129,6 +141,30 @@ struct BikeDetailView: View {
                 }
                 .disabled(!primaryButtonEnabled)
                 .padding(.top, 8)
+
+                Button {
+                    Task {
+                        _ = await bluetoothLockManager.lockDemoBike()
+                    }
+                } label: {
+                    Text("Test Lock Command (0x00)")
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                }
+                .buttonStyle(.bordered)
+                .disabled(isUnlocking || bluetoothLockManager.isBusy)
+
+                Button {
+                    Task {
+                        _ = await bluetoothLockManager.refreshLockStatus()
+                    }
+                } label: {
+                    Text("Refresh Lock Status")
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                }
+                .buttonStyle(.bordered)
+                .disabled(isUnlocking || bluetoothLockManager.isBusy)
             }
             .padding()
         }
@@ -202,10 +238,12 @@ struct BikeDetailView: View {
         isUnlocking = true
         defer { isUnlocking = false }
 
-        let location = await locationManager.requestSingleLocation()
+        async let locationTask = locationManager.requestSingleLocation()
         let unlockSucceeded = await bluetoothLockManager.unlockDemoBike()
 
         guard unlockSucceeded else { return }
+
+        let location = await locationTask
 
         let startLocation = location.map { coordinate in
             String(format: "%.5f, %.5f", coordinate.latitude, coordinate.longitude)
