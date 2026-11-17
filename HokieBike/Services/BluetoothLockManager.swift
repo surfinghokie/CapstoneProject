@@ -238,7 +238,7 @@ final class BluetoothLockManager: NSObject, ObservableObject {
         timeoutTask?.cancel()
         timeoutTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
-            guard let self, self.continuation != nil else { return }
+            guard !Task.isCancelled, let self, self.continuation != nil else { return }
             self.finish(success: false, message: message)
         }
     }
