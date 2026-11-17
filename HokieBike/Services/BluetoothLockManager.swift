@@ -11,6 +11,8 @@ final class BluetoothLockManager: NSObject, ObservableObject {
     @Published var sessionStep: String = "Idle"
     @Published var lastKnownStateText: String = "Unknown"
     @Published var lastCheckedAt: Date?
+    @Published var lastErrorDetail: String?
+    @Published var lastBLEErrorCode: String?
 
     struct DiscoveredDevice: Identifiable {
         let id: UUID
@@ -21,8 +23,8 @@ final class BluetoothLockManager: NSObject, ObservableObject {
     }
 
     private enum Timeout {
-        static let scan: Double = 10
-        static let connect: Double = 10
+        static let scan: Double = 20
+        static let connect: Double = 20
         static let discover: Double = 5
         static let infoRead: Double = 5
         static let subscribe: Double = 5
@@ -30,6 +32,8 @@ final class BluetoothLockManager: NSObject, ObservableObject {
         static let writeResult: Double = 5
         static let settle: Double = 10
     }
+
+    // V1 firmware is one-lock, one-session-at-a-time. Keep the session deterministic.
 
     private enum LockUUID {
         static let service = CBUUID(string: "8F2A1C00-5B7E-4D19-9A3F-6C2E81D4B70A")
@@ -114,6 +118,8 @@ final class BluetoothLockManager: NSObject, ObservableObject {
     private var characteristics: [CBUUID: CBCharacteristic] = [:]
     private var continuation: CheckedContinuation<Bool, Never>?
     private var timeoutTask: Task<Void, Never>?
+    private var discoveredPeripherals: [UUID: CBPeripheral] = [:]
+    private var currentlyConnectingID: UUID?
 
     private var expectedResultSeq: UInt8?
     private var waitingForSettle = false
@@ -121,6 +127,7 @@ final class BluetoothLockManager: NSObject, ObservableObject {
     private var queuedCommand: LockCommand?
     private var currentCommand: LockCommand = .unlock
     private var hasSentCommand = false
+    private var commandWriteType: CBCharacteristicWriteType = .withResponse
 
     private enum SessionMode {
         case refreshOnly
@@ -132,6 +139,8 @@ final class BluetoothLockManager: NSObject, ObservableObject {
     private func resetDiscoveryUI() {
         discoveredDevices = []
         isScanning = false
+        discoveredPeripherals = [:]
+        currentlyConnectingID = nil
     }
 
     override init() {
@@ -178,6 +187,8 @@ final class BluetoothLockManager: NSObject, ObservableObject {
         }
 
         isBusy = true
+        lastErrorDetail = nil
+        lastBLEErrorCode = nil
         sessionMode = mode
         if case .command(let command) = mode {
             currentCommand = command
@@ -195,6 +206,8 @@ final class BluetoothLockManager: NSObject, ObservableObject {
             self.waitingForSettle = false
             self.expectedResultSeq = nil
             self.characteristics = [:]
+            self.discoveredPeripherals = [:]
+            self.currentlyConnectingID = nil
             if case .command(let command) = mode {
                 self.queuedCommand = command
                 self.currentCommand = command
@@ -217,12 +230,34 @@ final class BluetoothLockManager: NSObject, ObservableObject {
         #endif
     }
 
+    private func connectToPeripheral(_ peripheral: CBPeripheral, name: String) {
+        guard let central else { return }
+        currentlyConnectingID = peripheral.identifier
+        self.peripheral = peripheral
+        peripheral.delegate = self
+        sessionStep = "Connecting"
+        statusMessage = "Connecting to \(name)..."
+        central.stopScan()
+        isScanning = false
+        central.connect(peripheral)
+        scheduleTimeout(seconds: Timeout.connect, message: "Could not connect to lock.")
+    }
+
     private func startScan() {
         guard let central else { return }
         isScanning = true
         sessionStep = "Scanning for service"
         statusMessage = "Scanning for lock..."
         central.stopScan()
+
+        // If iOS already has a connected peripheral for this service, prefer it.
+        let alreadyConnected = central.retrieveConnectedPeripherals(withServices: [LockUUID.service])
+        if let connected = alreadyConnected.first {
+            isScanning = false
+            connectToPeripheral(connected, name: connected.name ?? "Known Lock")
+            return
+        }
+
         central.scanForPeripherals(withServices: [LockUUID.service])
         scheduleTimeout(seconds: Timeout.scan, message: "Lock not found. It may be connected to another phone.")
     }
@@ -238,8 +273,21 @@ final class BluetoothLockManager: NSObject, ObservableObject {
         timeoutTask?.cancel()
         timeoutTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
-            guard let self, self.continuation != nil else { return }
-            self.finish(success: false, message: message)
+            guard !Task.isCancelled, let self, self.continuation != nil else { return }
+
+            if message == "Could not connect to lock." {
+                self.currentlyConnectingID = nil
+                self.finish(success: false, message: "Lock advertisement found, but session could not connect in time. It may be connected to another phone/app.")
+                return
+            }
+
+             let resolvedMessage: String
+             if message.hasPrefix("Lock not found"), !self.discoveredDevices.isEmpty {
+                 resolvedMessage = "Lock advertisement found, but session could not connect in time."
+             } else {
+                 resolvedMessage = message
+             }
+             self.finish(success: false, message: resolvedMessage)
         }
     }
 
@@ -251,6 +299,8 @@ final class BluetoothLockManager: NSObject, ObservableObject {
         sessionStep = success ? "Completed" : "Failed"
         queuedCommand = nil
         hasSentCommand = false
+        commandWriteType = .withResponse
+        currentlyConnectingID = nil
 
         central?.stopScan()
 
@@ -265,6 +315,29 @@ final class BluetoothLockManager: NSObject, ObservableObject {
         } else {
             isBusy = false
         }
+    }
+
+    private func describeBLEError(_ error: Error?, peripheral: CBPeripheral? = nil) -> String? {
+        guard let error else { return nil }
+
+        let nsError = error as NSError
+        var parts: [String] = []
+        parts.append("domain=\(nsError.domain)")
+        parts.append("code=\(nsError.code)")
+
+        if nsError.domain == CBErrorDomain,
+           let cbError = CBError.Code(rawValue: nsError.code) {
+            parts.append("cb=\(String(describing: cbError))")
+        }
+
+        if let peripheral {
+            let name = peripheral.name ?? "Unknown"
+            parts.append("peripheral=\(name)")
+            parts.append("id=\(peripheral.identifier.uuidString)")
+        }
+
+        parts.append("desc=\(error.localizedDescription)")
+        return parts.joined(separator: " | ")
     }
 }
 
@@ -291,15 +364,19 @@ extension BluetoothLockManager: CBCentralManagerDelegate {
     }
 
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String : Any], rssi RSSI: NSNumber) {
+        guard continuation != nil else { return }
+
         let displayName = peripheral.name ?? (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? "Unknown"
         let advertisedUUIDs = advertisedUUIDList(from: advertisementData)
+        let isConnectable = (advertisementData[CBAdvertisementDataIsConnectable] as? NSNumber)?.boolValue ?? true
+        discoveredPeripherals[peripheral.identifier] = peripheral
 
         if let idx = discoveredDevices.firstIndex(where: { $0.id == peripheral.identifier }) {
             discoveredDevices[idx] = DiscoveredDevice(
                 id: peripheral.identifier,
                 name: displayName,
                 rssi: RSSI.intValue,
-                isCandidate: true,
+                isCandidate: isConnectable,
                 advertisedUUIDs: advertisedUUIDs
             )
         } else {
@@ -308,7 +385,7 @@ extension BluetoothLockManager: CBCentralManagerDelegate {
                     id: peripheral.identifier,
                     name: displayName,
                     rssi: RSSI.intValue,
-                    isCandidate: true,
+                    isCandidate: isConnectable,
                     advertisedUUIDs: advertisedUUIDs
                 )
             )
@@ -319,35 +396,47 @@ extension BluetoothLockManager: CBCentralManagerDelegate {
             discoveredDevices = Array(discoveredDevices.prefix(10))
         }
 
-        central.stopScan()
-        isScanning = false
-        sessionStep = "Connecting"
-        self.peripheral = peripheral
-        peripheral.delegate = self
-        statusMessage = "Connecting to \(displayName)..."
-        central.connect(peripheral)
-        scheduleTimeout(seconds: Timeout.connect, message: "Could not connect to lock.")
+        guard isConnectable else {
+            sessionStep = "Discovered non-connectable advertisement"
+            return
+        }
+
+        sessionStep = "Discovered lock advertisement"
+        if currentlyConnectingID == nil {
+            connectToPeripheral(peripheral, name: displayName)
+        }
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-        sessionStep = "Discovering services"
-        statusMessage = "Preparing lock..."
-        peripheral.discoverServices([LockUUID.service])
-        scheduleTimeout(seconds: Timeout.discover, message: "Lock service discovery timed out.")
+        central.stopScan()
+        isScanning = false
+        currentlyConnectingID = nil
+         sessionStep = "Discovering services"
+         statusMessage = "Preparing lock..."
+         peripheral.discoverServices([LockUUID.service])
+         scheduleTimeout(seconds: Timeout.discover, message: "Lock service discovery timed out.")
     }
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
-        finish(success: false, message: "Failed to connect to lock.")
+         lastErrorDetail = error?.localizedDescription
+         lastBLEErrorCode = describeBLEError(error, peripheral: peripheral)
+         currentlyConnectingID = nil
+          finish(success: false, message: "Failed to connect to lock. Ensure no other phone/app is connected and try again.")
     }
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         self.peripheral = nil
         self.characteristics = [:]
+        currentlyConnectingID = nil
 
         guard continuation != nil else { return }
+        if let error {
+            lastErrorDetail = error.localizedDescription
+            lastBLEErrorCode = describeBLEError(error, peripheral: peripheral)
+        }
         if isBusy {
-            let unknownOutcome = hasSentCommand
-            finish(success: false, message: unknownOutcome ? "Disconnected before result arrived. Re-run to confirm lock state." : "Disconnected before command was sent.")
+             let unknownOutcome = hasSentCommand
+             finish(success: false, message: unknownOutcome ? "Disconnected before result arrived. Re-run to confirm lock state." : "Disconnected before command was sent.")
         }
     }
 }
@@ -424,6 +513,12 @@ extension BluetoothLockManager: CBPeripheralDelegate {
                     return
                 }
 
+                guard command.properties.contains(.write) else {
+                    finish(success: false, message: "Command characteristic is not writable.")
+                    return
+                }
+                commandWriteType = .withResponse
+
                 if queuedCommand == nil {
                     finish(success: true, message: "Status read complete.")
                     return
@@ -434,7 +529,7 @@ extension BluetoothLockManager: CBPeripheralDelegate {
                 statusMessage = "Sending \(currentCommand.verb) command..."
                 sessionStep = "Writing command"
                 hasSentCommand = true
-                peripheral.writeValue(Data([currentCommand.opcode]), for: command, type: .withResponse)
+                peripheral.writeValue(Data([currentCommand.opcode]), for: command, type: commandWriteType)
                 scheduleTimeout(seconds: Timeout.writeResult, message: "\(currentCommand.verb.capitalized) command timed out.")
                 return
             }
@@ -484,6 +579,7 @@ extension BluetoothLockManager: CBPeripheralDelegate {
     }
 
     func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
+        guard commandWriteType == .withResponse else { return }
         if error != nil {
             finish(success: false, message: "Lock rejected \(currentCommand.verb) write.")
         } else {

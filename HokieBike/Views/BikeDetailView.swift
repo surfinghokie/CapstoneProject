@@ -1,11 +1,9 @@
 import SwiftUI
-import CoreLocation
 
 struct BikeDetailView: View {
     let bike: Bike
     @EnvironmentObject var viewModel: AppViewModel
 
-    @StateObject private var locationManager = LocationPermissionManager()
     @StateObject private var bluetoothLockManager = BluetoothLockManager()
     @State private var isUnlocking = false
 
@@ -63,17 +61,25 @@ struct BikeDetailView: View {
                         .foregroundColor(.secondary)
                 }
 
+                if let errorDetail = bluetoothLockManager.lastErrorDetail, !errorDetail.isEmpty {
+                    Text("BLE Error: \(errorDetail)")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+
                 if bluetoothLockManager.lastCheckedAt != nil {
                     Text("Lock state: \(bluetoothLockManager.lastKnownStateText) · checked \(bluetoothLockManager.lastCheckedAt!, style: .relative)")
                         .font(.caption2)
                         .foregroundColor(.secondary)
                 }
 
-                if bluetoothLockManager.isBusy {
-                    Text("Session Step: \(bluetoothLockManager.sessionStep)")
-                        .font(.caption2)
-                        .foregroundColor(.secondary)
-                }
+                Text("Session Step: \(bluetoothLockManager.sessionStep)")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+
+                Text("BLE Detail: \(bluetoothLockManager.lastBLEErrorCode ?? "none")")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
 
                 if bluetoothLockManager.isBusy || !bluetoothLockManager.discoveredDevices.isEmpty {
                     VStack(alignment: .leading, spacing: 8) {
@@ -142,6 +148,22 @@ struct BikeDetailView: View {
                 .disabled(!primaryButtonEnabled)
                 .padding(.top, 8)
 
+                Text("Bluetooth test mode: unlock/lock commands can be sent anytime.")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+
+                Button {
+                    Task {
+                        _ = await bluetoothLockManager.unlockDemoBike()
+                    }
+                } label: {
+                    Text("Test Unlock Command (0x01)")
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                }
+                .buttonStyle(.bordered)
+                .disabled(isUnlocking || bluetoothLockManager.isBusy)
+
                 Button {
                     Task {
                         _ = await bluetoothLockManager.lockDemoBike()
@@ -179,9 +201,6 @@ struct BikeDetailView: View {
                 Image(systemName: viewModel.isBikeSaved(bike) ? "heart.fill" : "heart")
             }
         }
-        .task {
-            locationManager.requestPermissionIfNeeded()
-        }
     }
 
     @ViewBuilder
@@ -203,17 +222,14 @@ struct BikeDetailView: View {
     }
 
     private var primaryButtonEnabled: Bool {
-        viewModel.activeRental == nil && bike.isAvailable && !isUnlocking && !bluetoothLockManager.isBusy
+        !isUnlocking && !bluetoothLockManager.isBusy
     }
 
     private var buttonTitle: String {
-        if !bike.isAvailable || viewModel.activeRental != nil {
-            return "Unavailable"
-        }
         if isUnlocking || bluetoothLockManager.isBusy {
             return "Unlocking..."
         }
-        return "Unlock & Start Ride"
+        return "Send Unlock Command (0x01)"
     }
 
     private var lastSeenSourceText: String {
@@ -237,19 +253,7 @@ struct BikeDetailView: View {
         guard primaryButtonEnabled else { return }
         isUnlocking = true
         defer { isUnlocking = false }
-
-        async let locationTask = locationManager.requestSingleLocation()
-        let unlockSucceeded = await bluetoothLockManager.unlockDemoBike()
-
-        guard unlockSucceeded else { return }
-
-        let location = await locationTask
-
-        let startLocation = location.map { coordinate in
-            String(format: "%.5f, %.5f", coordinate.latitude, coordinate.longitude)
-        } ?? bike.location
-
-        viewModel.startRental(bike: bike, startLocation: startLocation, startCoordinate: location)
+        _ = await bluetoothLockManager.unlockDemoBike()
     }
 }
 
